@@ -3,6 +3,10 @@
 #include <stdint.h>
 #include <string.h>
 #include <assert.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <errno.h>
 
 #define ERR(args...) fprintf(stderr, args)
 
@@ -13,7 +17,7 @@ struct datentry {
     uint8_t *name;
 };
 
-struct {
+struct state {
     uint32_t folderentries;
     uint32_t fileentries;
 
@@ -22,8 +26,9 @@ struct {
     uint8_t *filestrings;
     uint32_t filestringslen;
 
+    uint8_t **folders;
     struct datentry *files;
-} state;
+};
 
 struct tokenizer {
     uint8_t *data;
@@ -53,7 +58,7 @@ uint8_t *get_next_name(struct tokenizer *t) {
         return NULL;
     }
 
-    uint8_t *c = memchr(t->data, '\0', t->len);
+    uint8_t *c = (uint8_t*)memchr(t->data, '\0', t->len);
     if (c == NULL) {
         ERR("Data wasn't null-terminated!\n");
         return NULL;
@@ -68,64 +73,77 @@ uint8_t *get_next_name(struct tokenizer *t) {
     return ret;
 }
 
-int eat_string_table(FILE *fp, uint32_t *len, uint8_t **data) {
+int eat_string_tables(FILE *fp, struct state *st) {
     size_t bytes;
-    uint32_t temp;
+    uint32_t len;
 
-    if (len == NULL || data == NULL) {
+    if (st == NULL) {
         return 0;
     }
 
-    if (!eat_int(fp, &temp)) {
-        ERR("Unable to get string table length\n");
+    if (!eat_int(fp, &st->folderstringslen) ||
+        !eat_int(fp, &st->filestringslen)) {
+        ERR("Unable to get string table lengths\n");
         return 0;
     }
 
-    uint8_t *stringtable = malloc(sizeof(uint8_t) * temp);
-    if ((bytes = fread(stringtable, sizeof(uint8_t), temp, fp)) != temp) {
-        ERR("Got %u ints when expecting %u in eat_string_table\n", (uint32_t)bytes, (uint32_t)temp);
+    len = st->folderstringslen;
+    st->folderstrings = (uint8_t*)malloc(sizeof(uint8_t) * len);
+    if ((bytes = fread(st->folderstrings, sizeof(uint8_t), len, fp)) != len) {
+        ERR("Got %u ints (expecting %u) in eat_string_tables\n", (uint32_t)bytes, (uint32_t)len);
         return 0;
     }
 
-    *len = temp;
-    *data = stringtable;
+    len = st->filestringslen;
+    st->filestrings = (uint8_t*)malloc(sizeof(uint8_t) * len);
+    if ((bytes = fread(st->filestrings, sizeof(uint8_t), len, fp)) != len) {
+        ERR("Got %u ints (expecting %u) in eat_string_tables\n", (uint32_t)bytes, (uint32_t)len);
+        return 0;
+    }
+
     return 1;
 }
 
-int eat_file_list(FILE *fp) {
+int eat_file_list(FILE *fp, struct state *st) {
     uint32_t temp, i;
     size_t folderentriespos, fileentriespos;
 
     if (!eat_int(fp, &temp)) {
         goto chomp_headers_error;
     }
-    // folder stuff is ignored because filenames have the folder info
-    state.folderentries = temp;
+    st->folderentries = temp;
     folderentriespos = ftell(fp);
-    fseek(fp, state.folderentries * 2 * sizeof(uint32_t), SEEK_CUR);
-    // file info is useful, though
+    fseek(fp, st->folderentries * 2 * sizeof(uint32_t), SEEK_CUR);
     if (!eat_int(fp, &temp)) {
         goto chomp_headers_error;
     }
-    state.fileentries = temp;
+    st->fileentries = temp;
     fileentriespos = ftell(fp);
-    fseek(fp, state.fileentries * 3 * sizeof(uint32_t), SEEK_CUR);
+    fseek(fp, st->fileentries * 3 * sizeof(uint32_t), SEEK_CUR);
 
-    if (!eat_string_table(fp, &state.folderstringslen, &state.folderstrings)) {
-        goto chomp_headers_error;
-    }
-    if (!eat_string_table(fp, &state.filestringslen, &state.filestrings)) {
+    if (!eat_string_tables(fp, st)) {
         goto chomp_headers_error;
     }
 
-    state.files = malloc(sizeof(struct datentry) * state.fileentries);
+    struct tokenizer t_;
+    t_.data = st->folderstrings;
+    t_.len = st->folderstringslen;
+
+    st->folders = (uint8_t**)malloc(sizeof(uint8_t*) * st->folderentries);
+
+    fseek(fp, folderentriespos, SEEK_SET);
+    for (i = 0; i < st->folderentries; i++) {
+        st->folders[i] = get_next_name(&t_);
+    }
 
     struct tokenizer t;
-    t.data = state.filestrings;
-    t.len = state.filestringslen;
+    t.data = st->filestrings;
+    t.len = st->filestringslen;
+
+    st->files = (struct datentry*)malloc(sizeof(struct datentry) * st->fileentries);
 
     fseek(fp, fileentriespos, SEEK_SET);
-    for (i = 0; i < state.fileentries; i++) {
+    for (i = 0; i < st->fileentries; i++) {
         size_t bytes;
         uint32_t file[3];
         if ((bytes = fread(file, sizeof(uint32_t), 3, fp)) != 3) {
@@ -133,7 +151,7 @@ int eat_file_list(FILE *fp) {
             exit(1);
         }
 
-        struct datentry *entry = &state.files[i];
+        struct datentry *entry = &st->files[i];
         entry->offset = file[0];
         entry->len = file[1];
         entry->dir = file[2];
@@ -192,9 +210,69 @@ int copy_to_file(FILE *fp, uint32_t offset, uint32_t len, char *newname) {
     return 1;
 }
 
+int _mkdir(char *dir) {
+    int ret = mkdir(dir, S_IRWXU);
+    if (ret) {
+        ret = errno;
+        switch (ret) {
+            case EEXIST: {
+                struct stat st;
+                ret = stat(dir, &st);
+                if (ret != 0) {
+                    ret = errno;
+                    printf("Error stat()ing %s: %s", dir, strerror(ret));
+                    return 0;
+                }
+                if (!S_ISDIR(st.st_mode)) {
+                    printf("Error: %s is not a directory\n", dir);
+                    return 0;
+                }
+                return 1;
+            }
+            default:
+                printf("Unable to make directory %s: %s\n", dir, strerror(ret));
+                break;
+        }
+        return 0;
+    }
+
+    return 1;
+}
+
+// this is a terrible hack
+// I just wanted something that worked
+int mkdir_recursive(const char *dir) {
+    uint32_t i, len = strlen(dir);
+    len = len > 255 ? 255 : len;
+
+    if (len < 1) {
+        return 1;
+    }
+
+    char temp[len + 1];
+    memcpy(temp, dir, len);
+    temp[len] = 0;
+
+    if (temp[len - 1] == '/') {
+        temp[len - 1] = 0;
+    }
+
+    for (i = 1; i < len; i++) {
+        if (temp[i] == '/') {
+            temp[i] = 0;
+            if (!_mkdir(temp)) {
+                return 0;
+            }
+            temp[i] = '/';
+        }
+    }
+    return _mkdir(temp);
+}
+
 int main(int argc, char *argv[]) {
     FILE *fp;
-    char *folder = NULL;
+    const char *folder = NULL;
+    struct state st;
 
     if (argc < 1) {
         ERR("usage: %s filename [folder]\n", argv[0]);
@@ -206,21 +284,37 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    if (!eat_file_list(fp)) {
+    if (!eat_file_list(fp, &st)) {
         ERR("Unable to parse file list\n");
         exit(1);
     }
 
     if (argc > 2) {
+        uint32_t i;
+
         folder = argv[2];
         printf("Extracting contents to \"%s\"\n", folder);
-        uint32_t i;
-        for (i = 0; i < state.fileentries; i++) {
-            struct datentry *file = &state.files[i];
 
-            char filename[256];
-            snprintf(filename, 256, "%s/%s", folder, file->name);
-            if (!copy_to_file(fp, file->offset, file->len, filename)) {
+        if (!mkdir_recursive(folder)) {
+            exit(1);
+        }
+        if (chdir((const char*)folder) != 0) {
+            int ret = errno;
+            printf("Unable to change directory to %s: %s\n", folder, strerror(ret));
+            exit(1);
+        }
+
+        for (i = 0; i < st.folderentries; i++) {
+            const char *name = (const char*)st.folders[i];
+
+            if (!mkdir_recursive(name)) {
+                exit(1);
+            }
+        }
+        for (i = 0; i < st.fileentries; i++) {
+            struct datentry *file = &st.files[i];
+
+            if (!copy_to_file(fp, file->offset, file->len, (char*)file->name)) {
                 ERR("Error extracting \"%s\"\n", file->name);
                 exit(1);
             }
@@ -228,8 +322,8 @@ int main(int argc, char *argv[]) {
     } else {
         printf("Listing contents of \"%s\":\n", argv[1]);
         uint32_t i;
-        for (i = 0; i < state.fileentries; i++) {
-            struct datentry *file = &state.files[i];
+        for (i = 0; i < st.fileentries; i++) {
+            struct datentry *file = &st.files[i];
             printf("%s %d\n", file->name, file->len);
         }
     }
