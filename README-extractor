@@ -6,9 +6,9 @@ License:
 don't claim you wrote it, and let me know if it's helpful :P
 
 How to use it:
-gcc -Wall -o smbdat smbdat.c
+gcc -Wall -o smbextractor smbextractor.c
 
-./smbdat blah.dat
+./smbextractor blah.dat
     -lists all files in the .dat
-./smbdat blah.dat some/crazy/folder/
+./smbextractor blah.dat some/crazy/folder/
     -extracts all files to some/crazy/folder/
