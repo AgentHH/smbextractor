@@ -10,14 +10,28 @@
 
 #define ERR(args...) fprintf(stderr, args)
 
-struct state {
+struct replayrecord {
+    uint8_t unknown[12];
+} __attribute__((__packed__));
+
+struct replay {
     uint8_t *filename;
     uint8_t *levelname;
 
     uint8_t ghosts;
     uint8_t character;
+    uint32_t whichghost;
     uint32_t *runlen;
+    struct replayrecord **records;
 };
+
+struct replayheader {
+    uint8_t levelname[16];
+    uint8_t ghosts;
+    uint8_t character;
+    uint16_t padding;
+    uint32_t whichghost;
+} __attribute__((__packed__));
 
 int eat_int(FILE *fp, uint32_t *out) {
     if (out == NULL) {
@@ -37,87 +51,112 @@ int eat_int(FILE *fp, uint32_t *out) {
     return 1;
 }
 
-int eat_replay_header(FILE *fp, struct state *st) {
-    struct {
-        uint8_t levelname[16];
-        uint8_t ghosts;
-        uint8_t character;
-        uint16_t padding;
-    } replayheader;
+void get_character(uint8_t character, char *buf, size_t len) {
+    const char *string;
 
+    switch (character) {
+        case 0:
+            string = "Super Meat Boy";
+            break;
+        default:
+            snprintf(buf, len, "unknown (%d)", character);
+            return;
+    }
+
+    snprintf(buf, len, "%s", string);
+}
+
+int eat_replay_header(FILE *fp, struct replay *rp) {
+    struct replayheader rph;
     size_t count;
 
-    if ((count = fread(&replayheader, sizeof(replayheader), 1, fp)) != 1) {
+    if ((count = fread(&rph, sizeof(struct replayheader), 1, fp)) != 1) {
         ERR("Got %u count when expecting 1 in eat_replay_header\n", (uint32_t)count);
         return 0;
     }
 
-    if (replayheader.padding != 0xffff) {
-        ERR("Padding should be 0xffff in eat_replay_header; got 0x%04x\n", replayheader.padding);
+    if (rph.padding != 0xffff) {
+        ERR("Padding should be 0xffff in eat_replay_header; got 0x%04x\n", rph.padding);
         return 0;
     }
 
-    replayheader.levelname[15] = 0;
-    st->levelname = (uint8_t*)strdup((char*)replayheader.levelname);
-    st->ghosts = replayheader.ghosts;
-    st->character = replayheader.character;
+    if (rph.whichghost >= rph.ghosts) {
+        ERR("Primary ghost is out of range (got %u, needed to be < %u\n", rph.whichghost, rph.ghosts);
+        return 0;
+    }
 
-    printf("lh  : [32mc %02x[0m tr %02x [34mn \"%s\"[0m\n", st->character, st->ghosts, st->levelname);
+    rph.levelname[15] = 0;
+    rp->levelname = (uint8_t*)strdup((char*)rph.levelname);
+    rp->ghosts = rph.ghosts;
+    rp->character = rph.character;
+    rp->whichghost = rph.whichghost;
+
+#ifdef DEBUG
+    char charname[32];
+    get_character(rp->character, charname, 32);
+
+    printf("lh  : [31mtr %02x[0m [32ms %02x[0m\n", rp->ghosts, rp->whichghost);
+    printf("lhn : [36mchar: %s[0m [35mlevel: \"%s\"[0m\n", charname, rp->levelname);
+#endif
 
     return 1;
 }
 
-int eat_run_headers(FILE *fp, struct state *st) {
-    uint32_t *ghostheader = malloc(sizeof(uint32_t) * st->ghosts);
+int eat_run_lengths(FILE *fp, struct replay *rp) {
+    uint32_t *ghostheader = malloc(sizeof(uint32_t) * rp->ghosts);
 
     size_t count;
 
-    if ((count = fread(ghostheader, sizeof(uint32_t), st->ghosts, fp)) != st->ghosts) {
-        ERR("Got %u ints when expecting %u in eat_run_headers\n", (uint32_t)count, st->ghosts);
+    if ((count = fread(ghostheader, sizeof(uint32_t), rp->ghosts, fp)) != rp->ghosts) {
+        ERR("Got %u ints when expecting %u in eat_run_lengths\n", (uint32_t)count, rp->ghosts);
         return 0;
     }
 
-    st->runlen = ghostheader;
+    rp->runlen = ghostheader;
 
+#ifdef DEBUG
     int i;
-    for (i = 0; i < st->ghosts; i++) {
-        printf("gh  : r %02x [33m%08x[0m\n", i, ghostheader[i]);
+    for (i = 0; i < rp->ghosts; i++) {
+        printf("gh  : [31mr %02x[0m [33ml %08x[0m\n", i, ghostheader[i]);
+    }
+#endif
+
+    return 1;
+}
+
+int eat_runs(FILE *fp, struct replay *rp) {
+    uint32_t i;
+
+    rp->records = malloc(sizeof(struct replayrecord*) * rp->ghosts);
+
+    for (i = 0; i < rp->ghosts; i++) {
+        size_t count;
+        uint32_t len = rp->runlen[i];
+        struct replayrecord *data = malloc(sizeof(struct replayrecord) * rp->runlen[i]);
+        rp->records[i] = data;
+#ifdef DEBUG
+        //printf("g   :%5u %5u\n", i, rp->runlen[i]);
+#endif
+        if ((count = fread(data, sizeof(struct replayrecord), len, fp)) != len) {
+            ERR("Got %u records when expecting %u in eat_runs\n", (uint32_t)count, len);
+            return 0;
+        }
     }
 
     return 1;
 }
 
-int eat_replay(FILE *fp, struct state *st) {
-    if (!eat_replay_header(fp, st)) {
+int eat_replay(FILE *fp, struct replay *rp) {
+    if (!eat_replay_header(fp, rp)) {
         return 0;
     }
 
-    uint32_t garbage;
-    if (!eat_int(fp, &garbage)) {
-        return 0;
-    }
-    if (garbage != st->ghosts - 1) {
-        printf("[31mWARNING: garbage is %u, not %u\n", garbage, st->ghosts - 1);
-    }
-
-    if (!eat_run_headers(fp, st)) {
+    if (!eat_run_lengths(fp, rp)) {
         return 0;
     }
 
-    printf("runs start at %08x\n", ftell(fp));
-
-    int i, j;
-    for (i = 0; i < st->ghosts; i++) {
-        printf("g   :%5u ------------------------------\n", i);
-        for (j = 0; j < st->runlen[i]; j++) {
-            uint32_t rec[3];
-            size_t count;
-            if ((count = fread(rec, sizeof(uint32_t), 3, fp)) != 3) {
-                ERR("Got %u ints when expecting %u in eat_\n", (uint32_t)count, 3);
-                return 0;
-            }
-            printf("rec :%5u %08x %08x %08x\n", j, rec[0], rec[1], rec[2]);
-        }
+    if (!eat_runs(fp, rp)) {
+        return 0;
     }
 
     return 1;
@@ -125,21 +164,21 @@ int eat_replay(FILE *fp, struct state *st) {
 
 int main(int argc, char *argv[]) {
     FILE *fp;
-    struct state st;
+    struct replay rp;
 
     if (argc < 1) {
         ERR("usage: %s filename\n", argv[0]);
         exit(1);
     }
 
-    st.filename = (uint8_t*)argv[1];
+    rp.filename = (uint8_t*)argv[1];
 
     if (!(fp = fopen(argv[1], "r"))) {
         ERR("Unable to open file %s\n", argv[1]);
         exit(1);
     }
 
-    if (!eat_replay(fp, &st)) {
+    if (!eat_replay(fp, &rp)) {
         ERR("Unable to parse replay\n");
         exit(1);
     }
