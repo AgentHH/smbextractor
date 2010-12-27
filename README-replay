@@ -1,0 +1,13 @@
+Super Meat Boy replay something-or-other
+Hans Nielsen, agenthh@gmail.com
+Copyright 2010
+
+License:
+don't claim you wrote it, and let me know if it's helpful :P
+
+How to use it:
+gcc -Wall -o smbreplay smbreplay.c
+Add -DDEBUG if you want printouts of extra garbage
+
+./smbreplay blah.rpl
+    -lists all runs in a replay
