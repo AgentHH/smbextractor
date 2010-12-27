@@ -16,6 +16,7 @@ struct state {
 
     uint8_t ghosts;
     uint8_t character;
+    uint32_t *runlen;
 };
 
 int eat_int(FILE *fp, uint32_t *out) {
@@ -67,13 +68,16 @@ int eat_replay_header(FILE *fp, struct state *st) {
 }
 
 int eat_run_headers(FILE *fp, struct state *st) {
-    uint32_t ghostheader[st->ghosts];
+    uint32_t *ghostheader = malloc(sizeof(uint32_t) * st->ghosts);
 
     size_t count;
+
     if ((count = fread(ghostheader, sizeof(uint32_t), st->ghosts, fp)) != st->ghosts) {
         ERR("Got %u ints when expecting %u in eat_run_headers\n", (uint32_t)count, st->ghosts);
         return 0;
     }
+
+    st->runlen = ghostheader;
 
     int i;
     for (i = 0; i < st->ghosts; i++) {
@@ -88,8 +92,32 @@ int eat_replay(FILE *fp, struct state *st) {
         return 0;
     }
 
+    uint32_t garbage;
+    if (!eat_int(fp, &garbage)) {
+        return 0;
+    }
+    if (garbage != st->ghosts - 1) {
+        printf("[31mWARNING: garbage is %u, not %u\n", garbage, st->ghosts - 1);
+    }
+
     if (!eat_run_headers(fp, st)) {
         return 0;
+    }
+
+    printf("runs start at %08x\n", ftell(fp));
+
+    int i, j;
+    for (i = 0; i < st->ghosts; i++) {
+        printf("g   :%5u ------------------------------\n", i);
+        for (j = 0; j < st->runlen[i]; j++) {
+            uint32_t rec[3];
+            size_t count;
+            if ((count = fread(rec, sizeof(uint32_t), 3, fp)) != 3) {
+                ERR("Got %u ints when expecting %u in eat_\n", (uint32_t)count, 3);
+                return 0;
+            }
+            printf("rec :%5u %08x %08x %08x\n", j, rec[0], rec[1], rec[2]);
+        }
     }
 
     return 1;
